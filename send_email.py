@@ -52,9 +52,7 @@ def send_owa_action(
     action: str,
     action_id: str,
     payload: Dict,
-    client_request_id: Optional[str] = None,
     action_name: Optional[str] = None,
-    owa_canary: Optional[str] = None,
     origin: str = "https://magnolia.amazon.com",
     timeout: int = 30,
 ) -> Dict:
@@ -74,16 +72,21 @@ def send_owa_action(
     # The OWA backend expects an `Action` header with the action name
     # (e.g. CreateItem / UpdateItem). Without it the server returns 500.
     headers["Action"] = action
-    if client_request_id:
-        headers["client-request-id"] = client_request_id
-        headers["x-owa-correlationid"] = client_request_id
     if action_name:
         headers["x-owa-actionname"] = action_name
     if action_id:
         headers["x-owa-actionid"] = str(action_id)
-    if owa_canary:
-        headers["x-owa-canary"] = owa_canary
-
+    # If the OWA canary is present as a cookie (browser includes it in -b),
+    # include it as a header as the service expects it there as well.
+    try:
+        # session.cookies is a RequestsCookieJar; iterate to find case-insensitive match
+        for c in session.cookies:
+            if c.name.lower() == "x-owa-canary":
+                headers["x-owa-canary"] = c.value
+                break
+    except Exception:
+        # don't fail if cookies can't be iterated for some reason
+        pass
     resp = session.post(url, json=payload, headers=headers, timeout=timeout)
     result = {"status_code": resp.status_code}
     try:
@@ -94,50 +97,97 @@ def send_owa_action(
     return result
 
 
-def build_create_payload(to_addrs: List[str], subject: str, body_html: str, send_direct: bool = False) -> Dict:
-    """Construct a CreateItem JSON payload. If send_direct=True sets
-    MessageDisposition to SendAndSaveCopy (attempt single-step send).
+def build_payload(
+    action_type: str,
+    to_addrs: List[str],
+    subject: str,
+    body_html: str,
+    send_direct: bool = False,
+    item_id: Optional[str] = None,
+    change_key: Optional[str] = None,
+) -> Dict:
+    """Build either a CreateItem or UpdateItem JSON payload.
+
+    - action_type: "CreateItem" or "UpdateItem"
+    - For CreateItem, set `send_direct=True` to use MessageDisposition=SendAndSaveCopy.
+    - For UpdateItem, supply `item_id` (and optionally `change_key`).
     """
     to_recipients = [
         {"Name": addr, "EmailAddress": addr, "RoutingType": "SMTP", "MailboxType": "Mailbox", "RelevanceScore": 2147483646}
         for addr in to_addrs
     ]
 
-    body = {
-        "__type": "CreateItemJsonRequest:#Exchange",
-        "Header": {
-            "__type": "JsonRequestHeaders:#Exchange",
-            "RequestServerVersion": "V2015_10_15",
-            "TimeZoneContext": {"__type": "TimeZoneContext:#Exchange", "TimeZoneDefinition": {"__type": "TimeZoneDefinitionType:#Exchange", "Id": "Pacific Standard Time"}},
-        },
-        "Body": {
-            "__type": "CreateItemRequest:#Exchange",
-            "Items": [
-                {
-                    "__type": "Message:#Exchange",
-                    "Subject": subject,
-                    "Body": {"__type": "BodyContentType:#Exchange", "BodyType": "HTML", "Value": body_html},
-                    "Importance": "Normal",
-                    "From": None,
-                    "ToRecipients": to_recipients,
-                    "CcRecipients": [],
-                    "BccRecipients": [],
-                    "Sensitivity": "Normal",
-                    "IsDeliveryReceiptRequested": False,
-                    "IsReadReceiptRequested": False,
-                    "PendingSocialActivityTagIds": [],
-                }
-            ],
-            "ClientSupportsIrm": True,
-            "OutboundCharset": "AutoDetect",
-            "PromoteEmojiContentToInlineAttachmentsCount": 0,
-            "UnpromotedInlineImageCount": 0,
-            # if send_direct -> attempt to send in one step
-            "MessageDisposition": "SendAndSaveCopy" if send_direct else "SaveOnly",
-            "ComposeOperation": "newMail",
-        },
-    }
-    return body
+    if action_type == "CreateItem":
+        return {
+            "__type": "CreateItemJsonRequest:#Exchange",
+            "Header": {
+                "__type": "JsonRequestHeaders:#Exchange",
+                "RequestServerVersion": "V2015_10_15",
+                "TimeZoneContext": {"__type": "TimeZoneContext:#Exchange", "TimeZoneDefinition": {"__type": "TimeZoneDefinitionType:#Exchange", "Id": "Pacific Standard Time"}},
+            },
+            "Body": {
+                "__type": "CreateItemRequest:#Exchange",
+                "Items": [
+                    {
+                        "__type": "Message:#Exchange",
+                        "Subject": subject,
+                        "Body": {"__type": "BodyContentType:#Exchange", "BodyType": "HTML", "Value": body_html},
+                        "Importance": "Normal",
+                        "From": None,
+                        "ToRecipients": to_recipients,
+                        "CcRecipients": [],
+                        "BccRecipients": [],
+                        "Sensitivity": "Normal",
+                        "IsDeliveryReceiptRequested": False,
+                        "IsReadReceiptRequested": False,
+                        "PendingSocialActivityTagIds": [],
+                    }
+                ],
+                "ClientSupportsIrm": True,
+                "OutboundCharset": "AutoDetect",
+                "PromoteEmojiContentToInlineAttachmentsCount": 0,
+                "UnpromotedInlineImageCount": 0,
+                "MessageDisposition": "SendAndSaveCopy" if send_direct else "SaveOnly",
+                "ComposeOperation": "newMail",
+            },
+        }
+
+    if action_type == "UpdateItem":
+        if not item_id:
+            raise ValueError("item_id is required for UpdateItem payload")
+        return {
+            "__type": "UpdateItemJsonRequest:#Exchange",
+            "Header": {
+                "__type": "JsonRequestHeaders:#Exchange",
+                "RequestServerVersion": "Exchange2015",
+                "TimeZoneContext": {"__type": "TimeZoneContext:#Exchange", "TimeZoneDefinition": {"__type": "TimeZoneDefinitionType:#Exchange", "Id": "Pacific Standard Time"}},
+            },
+            "Body": {
+                "__type": "UpdateItemRequest:#Exchange",
+                "ItemChanges": [
+                    {
+                        "__type": "ItemChange:#Exchange",
+                        "Updates": [
+                            {
+                                "__type": "SetItemField:#Exchange",
+                                "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "ToRecipients"},
+                                "Item": {"__type": "Message:#Exchange", "ToRecipients": to_recipients},
+                            },
+                            {"__type": "SetItemField:#Exchange", "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "Subject"}, "Item": {"__type": "Message:#Exchange", "Subject": subject}},
+                            {"__type": "SetItemField:#Exchange", "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "Body"}, "Item": {"__type": "Message:#Exchange", "Body": {"__type": "BodyContentType:#Exchange", "BodyType": "HTML", "Value": body_html}}},
+                        ],
+                        "ItemId": {"__type": "ItemId:#Exchange", "Id": item_id, "ChangeKey": change_key},
+                    }
+                ],
+                "ConflictResolution": "AlwaysOverwrite",
+                "ClientSupportsIrm": True,
+                "SendCalendarInvitationsOrCancellations": "SendToNone",
+                "MessageDisposition": "SendAndSaveCopy",
+                "SuppressReadReceipts": False,
+            },
+        }
+
+    raise ValueError(f"Unsupported action_type: {action_type}")
 
 
 def find_itemid(obj) -> Optional[Tuple[str, Optional[str]]]:
@@ -178,28 +228,22 @@ def main() -> int:
     # optional headers used by the browser flow
     create_action_id = os.getenv("CREATE_ACTION_ID")
     create_action_name = os.getenv("CREATE_ACTION_NAME")
-    create_client_request_id = os.getenv("CREATE_CLIENT_REQUEST_ID")
-    create_owa_canary = os.getenv("CREATE_OWA_CANARY")
 
     update_action_id = os.getenv("UPDATE_ACTION_ID")
     update_action_name = os.getenv("UPDATE_ACTION_NAME")
-    update_client_request_id = os.getenv("UPDATE_CLIENT_REQUEST_ID")
-    update_owa_canary = os.getenv("UPDATE_OWA_CANARY")
 
     session = session_from_cookie_string(cookie_string)
 
     # If both create and update action info present, use two-step flow
     if create_action_id and update_action_id:
         print("Creating draft (CreateItem) for:", to_addrs)
-        create_payload = build_create_payload(to_addrs, subject, body, send_direct=False)
+        create_payload = build_payload("CreateItem", to_addrs, subject, body, send_direct=False)
         create_resp = send_owa_action(
             session=session,
             action="CreateItem",
             action_id=create_action_id,
             payload=create_payload,
-            client_request_id=create_client_request_id,
             action_name=create_action_name,
-            owa_canary=create_owa_canary,
         )
 
         if create_resp.get("status_code", 0) >= 400:
@@ -216,33 +260,7 @@ def main() -> int:
         print("Created item id:", item_id_val)
 
         # Build UpdateItem payload to set To/Subject/Body and send
-        update_payload = {
-            "__type": "UpdateItemJsonRequest:#Exchange",
-            "Header": {
-                "__type": "JsonRequestHeaders:#Exchange",
-                "RequestServerVersion": "Exchange2015",
-                "TimeZoneContext": {"__type": "TimeZoneContext:#Exchange", "TimeZoneDefinition": {"__type": "TimeZoneDefinitionType:#Exchange", "Id": "Pacific Standard Time"}},
-            },
-            "Body": {
-                "__type": "UpdateItemRequest:#Exchange",
-                "ItemChanges": [
-                    {
-                        "__type": "ItemChange:#Exchange",
-                        "Updates": [
-                            {"__type": "SetItemField:#Exchange", "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "ToRecipients"}, "Item": {"__type": "Message:#Exchange", "ToRecipients": [{"Name": addr, "EmailAddress": addr, "RoutingType": "SMTP", "MailboxType": "Mailbox", "RelevanceScore": 2147483646} for addr in to_addrs]}},
-                            {"__type": "SetItemField:#Exchange", "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "Subject"}, "Item": {"__type": "Message:#Exchange", "Subject": subject}},
-                            {"__type": "SetItemField:#Exchange", "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "Body"}, "Item": {"__type": "Message:#Exchange", "Body": {"__type": "BodyContentType:#Exchange", "BodyType": "HTML", "Value": body}}},
-                        ],
-                        "ItemId": {"__type": "ItemId:#Exchange", "Id": item_id_val, "ChangeKey": change_key},
-                    }
-                ],
-                "ConflictResolution": "AlwaysOverwrite",
-                "ClientSupportsIrm": True,
-                "SendCalendarInvitationsOrCancellations": "SendToNone",
-                "MessageDisposition": "SendAndSaveCopy",
-                "SuppressReadReceipts": False,
-            },
-        }
+        update_payload = build_payload("UpdateItem", to_addrs, subject, body, item_id=item_id_val, change_key=change_key)
 
         print("Sending (UpdateItem) item id:", item_id_val)
         update_resp = send_owa_action(
@@ -250,9 +268,7 @@ def main() -> int:
             action="UpdateItem",
             action_id=update_action_id,
             payload=update_payload,
-            client_request_id=update_client_request_id,
             action_name=update_action_name,
-            owa_canary=update_owa_canary,
         )
 
         print(json.dumps(update_resp, indent=2))
@@ -260,8 +276,14 @@ def main() -> int:
 
     # Fallback: single-step CreateItem with MessageDisposition SendAndSaveCopy
     print("Attempting single-step CreateItem (send) for:", to_addrs)
-    send_payload = build_create_payload(to_addrs, subject, body, send_direct=True)
-    send_resp = send_owa_action(session=session, action="CreateItem", action_id="-1", payload=send_payload)
+    send_payload = build_payload("CreateItem", to_addrs, subject, body, send_direct=True)
+    send_resp = send_owa_action(
+        session=session,
+        action="CreateItem",
+        action_id="-1",
+        payload=send_payload,
+        action_name=create_action_name,
+    )
     print(json.dumps(send_resp, indent=2))
     return 0 if send_resp.get("status_code", 0) < 400 else 5
 

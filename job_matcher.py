@@ -154,12 +154,28 @@ def aggregate_from_disk(
 
     total_cost_known = 0.0
     unknown_cost_count = 0
+    token_summary_by_model: Dict[str, Dict[str, int]] = {}
+    cost_usd_by_model_known: Dict[str, float] = {}
+
     for r in merged_all:
         c = r.get("cost_usd")
         if c is None:
             unknown_cost_count += 1
         else:
             total_cost_known += float(c)
+        
+        ubm = r.get("usage_by_model")
+        if isinstance(ubm, dict):
+            for m, t in ubm.items():
+                token_summary_by_model.setdefault(m, {"prompt_tokens": 0, "candidate_tokens": 0, "total_tokens": 0})
+                token_summary_by_model[m]["prompt_tokens"] += int(t.get("prompt_tokens") or 0)
+                token_summary_by_model[m]["candidate_tokens"] += int(t.get("candidate_tokens") or 0)
+                token_summary_by_model[m]["total_tokens"] += int(t.get("total_tokens") or 0)
+
+        cbm = r.get("cost_by_model")
+        if isinstance(cbm, dict):
+            for m, c in cbm.items():
+                cost_usd_by_model_known[m] = cost_usd_by_model_known.get(m, 0.0) + float(c or 0.0)
 
     aggregated = {
         "yes_ranked": yes_ranked,
@@ -168,6 +184,8 @@ def aggregate_from_disk(
         "cost_summary": {
             "pricing_mode": pricing_mode,
             "total_cost_usd_known": total_cost_known,
+            "token_summary_by_model": token_summary_by_model,
+            "cost_usd_by_model_known": cost_usd_by_model_known,
             "jobs_with_unknown_cost": unknown_cost_count,
             "pricing_usd_per_1m": pricing_usd_per_1m,
             "pro_prompt_tier_threshold_tokens": pro_prompt_tier_threshold_tokens,
@@ -264,6 +282,67 @@ def cost_usd(model: str, usage: Optional[Dict[str, int]], pricing_mode: str) -> 
     inp_cost = (prompt_tokens / 1_000_000) * inp_rate
     out_cost = (candidate_tokens / 1_000_000) * out_rate
     return inp_cost + out_cost
+
+
+def cost_for_model(
+    model: str,
+    prompt_tokens: int,
+    candidate_tokens: int,
+    pricing_mode: str,
+    pro_prompt_tier_threshold_tokens: int,
+    pricing_usd_per_1m: Dict[str, Any],
+) -> float:
+    model_key = str(model)
+    if model_key not in pricing_usd_per_1m:
+        return 0.0
+
+    rates = pricing_usd_per_1m[model_key][pricing_mode]
+
+    # Pro has <=200k vs >200k tiers; your prompts are practically always <=200k.
+    if model_key == "gemini-2.5-pro":
+        tier = "le_200k"  # if you later want, decide tier by prompt length
+        in_rate = float(rates[tier]["input"])
+        out_rate = float(rates[tier]["output"])
+    else:
+        in_rate = float(rates["flat"]["input"])
+        out_rate = float(rates["flat"]["output"])
+
+    return (prompt_tokens / 1_000_000.0) * in_rate + (candidate_tokens / 1_000_000.0) * out_rate
+
+
+def sum_usage(usage: Optional[Dict[str, int]]) -> Dict[str, int]:
+    if not usage:
+        return {"prompt_tokens": 0, "candidate_tokens": 0, "total_tokens": 0}
+    pt = int(usage.get("prompt_tokens") or 0)
+    ct = int(usage.get("candidate_tokens") or 0)
+    return {"prompt_tokens": pt, "candidate_tokens": ct, "total_tokens": pt + ct}
+
+
+def sum_usage_by_step(usage_by_step: Dict[str, Optional[Dict[str, int]]]) -> Dict[str, int]:
+    pt = 0
+    ct = 0
+    for u in (usage_by_step or {}).values():
+        if not u:
+            continue
+        pt += int(u.get("prompt_tokens") or 0)
+        ct += int(u.get("candidate_tokens") or 0)
+    return {"prompt_tokens": pt, "candidate_tokens": ct, "total_tokens": pt + ct}
+
+
+def usage_by_model_from_steps(usage_by_step: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
+    out: Dict[str, Dict[str, int]] = {}
+    for _, u in (usage_by_step or {}).items():
+        if not isinstance(u, dict):
+            continue
+        model = str(u.get("model") or "unknown")
+        pt = int(u.get("prompt_tokens") or 0)
+        ct = int(u.get("candidate_tokens") or 0)
+        if model not in out:
+            out[model] = {"prompt_tokens": 0, "candidate_tokens": 0, "total_tokens": 0}
+        out[model]["prompt_tokens"] += pt
+        out[model]["candidate_tokens"] += ct
+        out[model]["total_tokens"] += pt + ct
+    return out
 
 
 def extract_usage_from_event(event: Any) -> Optional[Dict[str, int]]:
@@ -580,8 +659,7 @@ async def run_agent_text(
 
     runner = runtime.runners[agent_name]
     last_text = ""
-    last_usage: Optional[Dict[str, int]] = None
-
+    
     async for event in runner.run_async(
         user_id=USER_ID,
         session_id=session_id,
@@ -606,13 +684,18 @@ async def run_agent_text(
                     last_text = chunk
 
         usage = extract_usage_from_event(event)
-        if usage:
-            last_usage = usage
-
+        
         if hasattr(event, "is_final_response") and event.is_final_response():
             break
 
-    return last_text.strip(), last_usage
+    call_meta = {
+        "model": getattr(runner.agent, "model", "unknown"),
+        "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+        "candidate_tokens": int(usage.get("candidate_tokens") or 0),
+    }
+    call_meta["total_tokens"] = call_meta["prompt_tokens"] + call_meta["candidate_tokens"]
+
+    return last_text.strip(), call_meta
 
 
 def should_second_opinion(j1: Dict[str, Any]) -> bool:
@@ -645,7 +728,6 @@ async def process_one_job(runtime: AdkRuntime, candidate_text: str, sanitized_jo
 
     # Per-job cost tracking
     cost_total = 0.0
-    cost_known = True
     usage_by_step: Dict[str, Optional[Dict[str, int]]] = {}
     cost_by_step: Dict[str, Optional[float]] = {}
 
@@ -654,13 +736,6 @@ async def process_one_job(runtime: AdkRuntime, candidate_text: str, sanitized_jo
         runtime, "JobCardExtractor", json.dumps(sanitized_job), session_id=sid_jobcard
     )
     usage_by_step["job_card_extractor"] = usage
-    c = cost_usd(MODEL_FAST, usage, PRICING_MODE)
-    cost_by_step["job_card_extractor"] = c
-    if c is None:
-        cost_known = False
-    else:
-        cost_total += c
-
     if not job_card_raw.strip():
         raise RuntimeError("JobCardExtractor returned empty text; event extraction still not working.")
     job_card = await parse_json_or_retry(runtime, "JobCardExtractor", job_card_raw, sid_jobcard)
@@ -673,13 +748,6 @@ async def process_one_job(runtime: AdkRuntime, candidate_text: str, sanitized_jo
         session_id=sid_j1,
     )
     usage_by_step["judge1"] = usage
-    c = cost_usd(MODEL_STRONG, usage, PRICING_MODE)
-    cost_by_step["judge1"] = c
-    if c is None:
-        cost_known = False
-    else:
-        cost_total += c
-
     j1 = await parse_json_or_retry(runtime, "Judge1", j1_raw, sid_j1)
     final_decision = j1
 
@@ -695,13 +763,6 @@ async def process_one_job(runtime: AdkRuntime, candidate_text: str, sanitized_jo
             session_id=sid_j2,
         )
         usage_by_step["judge2"] = usage
-        c = cost_usd(MODEL_STRONG, usage, PRICING_MODE)
-        cost_by_step["judge2"] = c
-        if c is None:
-            cost_known = False
-        else:
-            cost_total += c
-
         judge2_out = await parse_json_or_retry(runtime, "Judge2", j2_raw, sid_j2)
 
         if judge2_out.get("decision") != j1.get("decision"):
@@ -720,13 +781,6 @@ async def process_one_job(runtime: AdkRuntime, candidate_text: str, sanitized_jo
                     session_id=sid_arb,
                 )
                 usage_by_step["arbiter"] = usage
-                c = cost_usd(MODEL_STRONG, usage, PRICING_MODE)
-                cost_by_step["arbiter"] = c
-                if c is None:
-                    cost_known = False
-                else:
-                    cost_total += c
-
                 arb_out = await parse_json_or_retry(runtime, "Arbiter", arb_raw, sid_arb)
                 final_decision = arb_out
             else:
@@ -755,20 +809,32 @@ async def process_one_job(runtime: AdkRuntime, candidate_text: str, sanitized_jo
         session_id=sid_sum,
     )
     usage_by_step["summary_writer"] = usage
-    c = cost_usd(MODEL_FAST, usage, PRICING_MODE)
-    cost_by_step["summary_writer"] = c
-    if c is None:
-        cost_known = False
-    else:
-        cost_total += c
+    
+    usage_by_model = usage_by_model_from_steps(usage_by_step)
+
+    cost_by_model = {}
+    for m, t in usage_by_model.items():
+        cost_by_model[m] = cost_for_model(
+            model=m,
+            prompt_tokens=int(t.get("prompt_tokens") or 0),
+            candidate_tokens=int(t.get("candidate_tokens") or 0),
+            pricing_mode=PRICING_MODE,
+            pro_prompt_tier_threshold_tokens=PRO_TIER_THRESHOLD_TOKENS,
+            pricing_usd_per_1m=PRICING_USD_PER_1M,
+        )
+
+    cost_total = sum(cost_by_model.values())
 
     logging.info(
-        "job_id=%s decision=%s score=%s pricing_mode=%s cost_usd=%s",
+        "job_id=%s decision=%s score=%s pricing_mode=%s cost_usd=%s usage_by_step=%s usage_by_model=%s cost_by_model=%s",
         sanitized_job["job_id"],
         final_decision.get("decision"),
         final_decision.get("score"),
         PRICING_MODE,
-        f"{cost_total:.6f}" if cost_known else "unknown",
+        f"{cost_total:.6f}",
+        json.dumps(usage_by_step),
+        json.dumps(usage_by_model),
+        json.dumps(cost_by_model),
     )
 
     return {
@@ -785,9 +851,12 @@ async def process_one_job(runtime: AdkRuntime, candidate_text: str, sanitized_jo
         "arbiter": arb_out,
         "job_card": job_card,
         "pricing_mode": PRICING_MODE,
-        "cost_usd": cost_total if cost_known else None,
+        "cost_usd": cost_total,
         "usage_by_step": usage_by_step,
         "cost_by_step": cost_by_step,
+        "usage_by_step": usage_by_step,
+        "usage_by_model": usage_by_model,
+        "cost_by_model": cost_by_model,
     }
 
 

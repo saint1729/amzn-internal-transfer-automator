@@ -7,6 +7,10 @@ Python automation for Amazon internal tools:
 - **job_matcher.py**: Apply heuristics to job listings to find candidate-suitable roles and produce match summaries
 - **extract_tokens.js**: Small DevTools script to extract Cognito `refreshToken` (and optionally `idToken`) from Chrome localStorage
 
+## Design
+
+![Internal Transfers Automator - Design Diagram](Internal%20Transfers%20Automator%20-%20Design%20Diagram.drawio.png)
+
 ## Setup
 
 1. Install dependencies:
@@ -30,10 +34,40 @@ cp .env.example .env
 ## Usage
 
 ### Send Email via OWA
+
+**CLI Usage (reads from .env):**
 ```bash
 source .venv/bin/activate
 python send_email.py
 ```
+
+**Programmatic Usage (function-based):**
+```python
+from send_email import send_email
+
+# Simple usage
+result = send_email(
+    to_addrs=["user@amazon.com"],
+    subject="Test Email",
+    body_html="<p>Hello!</p>"
+)
+
+# With CC and BCC
+result = send_email(
+    to_addrs=["recipient@amazon.com"],
+    cc_addrs=["cc1@amazon.com", "cc2@amazon.com"],
+    bcc_addrs=["bcc@amazon.com"],
+    subject="Project Update",
+    body_html="<p>See attached update...</p>"
+)
+
+if result["success"]:
+    print("Email sent successfully!")
+else:
+    print(f"Failed: {result.get('error')}")
+```
+
+**Note:** The function reads `COOKIE_STRING` and action IDs from `.env` automatically. You can override by passing `cookie_string`, `create_action_id`, etc. as parameters.
 
 ### Fetch Job Listings
 ```bash

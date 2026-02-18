@@ -1,17 +1,29 @@
 """send_email.py
 
-Single-file utility to send email via the OWA JSON endpoints used by the
-browser. Reads `COOKIE_STRING` and optional headers from `.env`.
+Utility to send email via the OWA JSON endpoints used by the browser.
+Supports To, CC, and BCC recipients.
 
-Usage (after filling .env and installing requirements):
+CLI Usage (reads config from .env):
   source .venv/bin/activate
   python send_email.py
 
-If `CREATE_ACTION_ID` and `UPDATE_ACTION_ID` are present in the
-environment, the script will perform a CreateItem (save draft) then
-UpdateItem (send) flow using those action IDs and canary values. If
-those are not present, the script attempts a single-step CreateItem
-with MessageDisposition=SendAndSaveCopy.
+Programmatic Usage:
+  from send_email import send_email
+  
+  result = send_email(
+      to_addrs=["user@amazon.com"],
+      cc_addrs=["cc@amazon.com"],
+      bcc_addrs=["bcc@amazon.com"],
+      subject="Test",
+      body_html="<p>Hello</p>"
+  )
+  
+  if result["success"]:
+      print("Sent!")
+
+The script can use either a two-step flow (CreateItem → UpdateItem) if
+CREATE_ACTION_ID and UPDATE_ACTION_ID are set, or a single-step
+CreateItem with MessageDisposition=SendAndSaveCopy.
 """
 from __future__ import annotations
 
@@ -102,6 +114,8 @@ def build_payload(
     to_addrs: List[str],
     subject: str,
     body_html: str,
+    cc_addrs: Optional[List[str]] = None,
+    bcc_addrs: Optional[List[str]] = None,
     send_direct: bool = False,
     item_id: Optional[str] = None,
     change_key: Optional[str] = None,
@@ -109,12 +123,23 @@ def build_payload(
     """Build either a CreateItem or UpdateItem JSON payload.
 
     - action_type: "CreateItem" or "UpdateItem"
+    - to_addrs: List of To recipient email addresses
+    - cc_addrs: Optional list of CC recipient email addresses
+    - bcc_addrs: Optional list of BCC recipient email addresses
     - For CreateItem, set `send_direct=True` to use MessageDisposition=SendAndSaveCopy.
     - For UpdateItem, supply `item_id` (and optionally `change_key`).
     """
     to_recipients = [
         {"Name": addr, "EmailAddress": addr, "RoutingType": "SMTP", "MailboxType": "Mailbox", "RelevanceScore": 2147483646}
         for addr in to_addrs
+    ]
+    cc_recipients = [
+        {"Name": addr, "EmailAddress": addr, "RoutingType": "SMTP", "MailboxType": "Mailbox", "RelevanceScore": 2147483646}
+        for addr in (cc_addrs or [])
+    ]
+    bcc_recipients = [
+        {"Name": addr, "EmailAddress": addr, "RoutingType": "SMTP", "MailboxType": "Mailbox", "RelevanceScore": 2147483646}
+        for addr in (bcc_addrs or [])
     ]
 
     if action_type == "CreateItem":
@@ -135,8 +160,8 @@ def build_payload(
                         "Importance": "Normal",
                         "From": None,
                         "ToRecipients": to_recipients,
-                        "CcRecipients": [],
-                        "BccRecipients": [],
+                        "CcRecipients": cc_recipients,
+                        "BccRecipients": bcc_recipients,
                         "Sensitivity": "Normal",
                         "IsDeliveryReceiptRequested": False,
                         "IsReadReceiptRequested": False,
@@ -172,6 +197,16 @@ def build_payload(
                                 "__type": "SetItemField:#Exchange",
                                 "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "ToRecipients"},
                                 "Item": {"__type": "Message:#Exchange", "ToRecipients": to_recipients},
+                            },
+                            {
+                                "__type": "SetItemField:#Exchange",
+                                "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "CcRecipients"},
+                                "Item": {"__type": "Message:#Exchange", "CcRecipients": cc_recipients},
+                            },
+                            {
+                                "__type": "SetItemField:#Exchange",
+                                "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "BccRecipients"},
+                                "Item": {"__type": "Message:#Exchange", "BccRecipients": bcc_recipients},
                             },
                             {"__type": "SetItemField:#Exchange", "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "Subject"}, "Item": {"__type": "Message:#Exchange", "Subject": subject}},
                             {"__type": "SetItemField:#Exchange", "Path": {"__type": "PropertyUri:#Exchange", "FieldURI": "Body"}, "Item": {"__type": "Message:#Exchange", "Body": {"__type": "BodyContentType:#Exchange", "BodyType": "HTML", "Value": body_html}}},
@@ -209,35 +244,75 @@ def find_itemid(obj) -> Optional[Tuple[str, Optional[str]]]:
     return None
 
 
-def main() -> int:
-    load_dotenv()
-    cookie_string = os.getenv("COOKIE_STRING")
+def send_email(
+    to_addrs: List[str],
+    subject: str,
+    body_html: str,
+    cc_addrs: Optional[List[str]] = None,
+    bcc_addrs: Optional[List[str]] = None,
+    cookie_string: Optional[str] = None,
+    create_action_id: Optional[str] = None,
+    create_action_name: Optional[str] = None,
+    update_action_id: Optional[str] = None,
+    update_action_name: Optional[str] = None,
+) -> Dict:
+    """Send an email via OWA.
+
+    Args:
+        to_addrs: List of To recipient email addresses (required)
+        subject: Email subject
+        body_html: Email body in HTML format
+        cc_addrs: Optional list of CC recipient email addresses
+        bcc_addrs: Optional list of BCC recipient email addresses
+        cookie_string: Browser cookie string. If None, reads from COOKIE_STRING env var
+        create_action_id: Optional CreateItem action ID. If None, reads from env
+        create_action_name: Optional CreateItem action name. If None, reads from env
+        update_action_id: Optional UpdateItem action ID. If None, reads from env
+        update_action_name: Optional UpdateItem action name. If None, reads from env
+
+    Returns:
+        Dict with keys: status_code, data, headers, success (bool)
+
+    Example:
+        result = send_email(
+            to_addrs=["user@example.com"],
+            subject="Test",
+            body_html="<p>Hello</p>",
+            cc_addrs=["cc@example.com"],
+            bcc_addrs=["bcc@example.com"]
+        )
+        if result["success"]:
+            print("Email sent successfully!")
+    """
+    # Load env if cookie_string not provided
+    if cookie_string is None:
+        load_dotenv()
+        cookie_string = os.getenv("COOKIE_STRING")
+    
     if not cookie_string:
-        print("COOKIE_STRING not set in .env. Exiting.")
-        return 1
+        return {"success": False, "error": "COOKIE_STRING not provided or not set in .env", "status_code": 0}
 
-    to_addrs_raw = os.getenv("TO_ADDRS")
-    if not to_addrs_raw:
-        print("TO_ADDRS not set in .env. Exiting.")
-        return 1
-    to_addrs = [s.strip() for s in to_addrs_raw.split(",") if s.strip()]
+    if not to_addrs:
+        return {"success": False, "error": "to_addrs cannot be empty", "status_code": 0}
 
-    subject = os.getenv("SUBJECT", "Test email from script")
-    body = os.getenv("BODY", "<p>Test</p><p>Thanks,</p><p>Your script</p>")
-
-    # optional headers used by the browser flow
-    create_action_id = os.getenv("CREATE_ACTION_ID")
-    create_action_name = os.getenv("CREATE_ACTION_NAME")
-
-    update_action_id = os.getenv("UPDATE_ACTION_ID")
-    update_action_name = os.getenv("UPDATE_ACTION_NAME")
+    # Get action IDs from env if not provided
+    if create_action_id is None:
+        create_action_id = os.getenv("CREATE_ACTION_ID")
+    if create_action_name is None:
+        create_action_name = os.getenv("CREATE_ACTION_NAME")
+    if update_action_id is None:
+        update_action_id = os.getenv("UPDATE_ACTION_ID")
+    if update_action_name is None:
+        update_action_name = os.getenv("UPDATE_ACTION_NAME")
 
     session = session_from_cookie_string(cookie_string)
 
     # If both create and update action info present, use two-step flow
     if create_action_id and update_action_id:
-        print("Creating draft (CreateItem) for:", to_addrs)
-        create_payload = build_payload("CreateItem", to_addrs, subject, body, send_direct=False)
+        # Step 1: CreateItem (save draft)
+        create_payload = build_payload(
+            "CreateItem", to_addrs, subject, body_html, cc_addrs=cc_addrs, bcc_addrs=bcc_addrs, send_direct=False
+        )
         create_resp = send_owa_action(
             session=session,
             action="CreateItem",
@@ -247,22 +322,25 @@ def main() -> int:
         )
 
         if create_resp.get("status_code", 0) >= 400:
-            print("CreateItem error status:", create_resp.get("status_code"))
-            print(json.dumps(create_resp, indent=2))
-            return 2
+            create_resp["success"] = False
+            create_resp["error"] = "CreateItem failed"
+            return create_resp
 
         itemid = find_itemid(create_resp.get("data", {}))
         if not itemid:
-            print("Could not find ItemId in CreateItem response. Response:")
-            print(json.dumps(create_resp, indent=2))
-            return 3
+            return {
+                "success": False,
+                "error": "Could not find ItemId in CreateItem response",
+                "status_code": create_resp.get("status_code"),
+                "data": create_resp.get("data"),
+            }
         item_id_val, change_key = itemid
-        print("Created item id:", item_id_val)
 
-        # Build UpdateItem payload to set To/Subject/Body and send
-        update_payload = build_payload("UpdateItem", to_addrs, subject, body, item_id=item_id_val, change_key=change_key)
-
-        print("Sending (UpdateItem) item id:", item_id_val)
+        # Step 2: UpdateItem (send)
+        update_payload = build_payload(
+            "UpdateItem", to_addrs, subject, body_html, cc_addrs=cc_addrs, bcc_addrs=bcc_addrs, 
+            item_id=item_id_val, change_key=change_key
+        )
         update_resp = send_owa_action(
             session=session,
             action="UpdateItem",
@@ -270,13 +348,15 @@ def main() -> int:
             payload=update_payload,
             action_name=update_action_name,
         )
-
-        print(json.dumps(update_resp, indent=2))
-        return 0 if update_resp.get("status_code", 0) < 400 else 4
+        update_resp["success"] = update_resp.get("status_code", 0) < 400
+        if not update_resp["success"]:
+            update_resp["error"] = "UpdateItem (send) failed"
+        return update_resp
 
     # Fallback: single-step CreateItem with MessageDisposition SendAndSaveCopy
-    print("Attempting single-step CreateItem (send) for:", to_addrs)
-    send_payload = build_payload("CreateItem", to_addrs, subject, body, send_direct=True)
+    send_payload = build_payload(
+        "CreateItem", to_addrs, subject, body_html, cc_addrs=cc_addrs, bcc_addrs=bcc_addrs, send_direct=True
+    )
     send_resp = send_owa_action(
         session=session,
         action="CreateItem",
@@ -284,9 +364,57 @@ def main() -> int:
         payload=send_payload,
         action_name=create_action_name,
     )
-    print(json.dumps(send_resp, indent=2))
-    return 0 if send_resp.get("status_code", 0) < 400 else 5
+    send_resp["success"] = send_resp.get("status_code", 0) < 400
+    if not send_resp["success"]:
+        send_resp["error"] = "Single-step CreateItem (send) failed"
+    return send_resp
+
+
+def usage_from_env() -> int:
+    """CLI entry point - reads config from .env and sends email."""
+    load_dotenv()
+    
+    to_addrs_raw = os.getenv("TO_ADDRS")
+    if not to_addrs_raw:
+        print("TO_ADDRS not set in .env. Exiting.")
+        return 1
+    to_addrs = [s.strip() for s in to_addrs_raw.split(",") if s.strip()]
+
+    # Optional CC and BCC from env
+    cc_addrs = None
+    cc_addrs_raw = os.getenv("CC_ADDRS")
+    if cc_addrs_raw:
+        cc_addrs = [s.strip() for s in cc_addrs_raw.split(",") if s.strip()]
+    
+    bcc_addrs = None
+    bcc_addrs_raw = os.getenv("BCC_ADDRS")
+    if bcc_addrs_raw:
+        bcc_addrs = [s.strip() for s in bcc_addrs_raw.split(",") if s.strip()]
+
+    subject = os.getenv("SUBJECT", "Test email from script")
+    body = os.getenv("BODY", "<p>Test</p><p>Thanks,</p><p>Your script</p>")
+
+    print(f"Sending email to: {to_addrs}")
+    if cc_addrs:
+        print(f"CC: {cc_addrs}")
+    if bcc_addrs:
+        print(f"BCC: {bcc_addrs}")
+    
+    result = send_email(
+        to_addrs=to_addrs,
+        subject=subject,
+        body_html=body,
+        cc_addrs=cc_addrs,
+        bcc_addrs=bcc_addrs,
+    )
+    
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("success") else 1
+
+
+def main():
+    pass
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(usage_from_env())

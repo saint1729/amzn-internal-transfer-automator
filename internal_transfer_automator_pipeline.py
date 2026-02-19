@@ -224,8 +224,9 @@ def build_email_addresses(employee_hierarchy: List[List[str]]) -> Dict[str, List
         if person[0]:  # Check alias exists
             cc_addrs.append(f"{person[0]}@amazon.com")
     
-    # return {"to": to_addrs, "cc": cc_addrs}
     return {"to": [], "cc": []}
+    # return {"to": to_addrs, "cc": cc_addrs}
+
 
 def prepare_email_content(
     hiring_manager: str,

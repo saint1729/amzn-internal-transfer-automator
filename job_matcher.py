@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import html
 import json
@@ -870,6 +871,16 @@ async def process_one_job(runtime: AdkRuntime, candidate_text: str, sanitized_jo
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
+    # full_run from argument parser
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--full-run",
+        action="store_false",
+        help="Process all jobs instead of just 1 (for testing)."
+    )
+    args = parser.parse_args()
+    full_run = args.full_run
+
     ensure_results_dirs()
 
     # Startup aggregation: recover progress from last run (per-job files) and refresh final output
@@ -910,8 +921,9 @@ async def main() -> None:
         logging.info("No new jobs to process. Exiting.")
         return
     
-    # keep 1 while debugging
-    sanitized_jobs = sanitized_jobs[:1]
+    if full_run:
+        # keep 1 while debugging
+        sanitized_jobs = sanitized_jobs[:1]
 
     session_service = InMemorySessionService()
 

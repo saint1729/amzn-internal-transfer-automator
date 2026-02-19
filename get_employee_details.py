@@ -21,7 +21,6 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import sys
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, quote, urlparse

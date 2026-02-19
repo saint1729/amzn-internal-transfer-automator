@@ -21,11 +21,15 @@ Usage:
 """
 import base64
 import json
+import logging
 import os
 import time
 from typing import Dict, Optional
 
 import requests
+
+# Configure logger for this module
+logger = logging.getLogger(__name__)
 
 
 def decode_jwt_payload(token: str) -> Optional[Dict]:
@@ -42,7 +46,7 @@ def decode_jwt_payload(token: str) -> Optional[Dict]:
         decoded = base64.urlsafe_b64decode(payload)
         return json.loads(decoded)
     except Exception as e:
-        print(f"Failed to decode JWT: {e}")
+        logger.error(f"Failed to decode JWT: {e}")
         return None
 
 
@@ -74,7 +78,7 @@ def refresh_id_token(refresh_token: str, client_id: str) -> Optional[str]:
 
     resp = requests.post(url, headers=headers, json=payload, timeout=30)
     if resp.status_code != 200:
-        print(f"Token refresh failed: {resp.status_code} {resp.text}")
+        logger.error(f"Token refresh failed: {resp.status_code} {resp.text}")
         return None
 
     data = resp.json()
@@ -82,7 +86,7 @@ def refresh_id_token(refresh_token: str, client_id: str) -> Optional[str]:
     new_id_token = auth_result.get("IdToken")
     
     if new_id_token:
-        print("Successfully refreshed ID token")
+        logger.info("Successfully refreshed ID token")
     return new_id_token
 
 
@@ -97,7 +101,7 @@ def get_cognito_identity_id(jwt_token: str, identity_pool_id: str, user_pool_pro
 
     resp = requests.post(url, headers=headers, json=payload, timeout=30)
     if resp.status_code != 200:
-        print(f"GetId failed: {resp.status_code} {resp.text}")
+        logger.error(f"GetId failed: {resp.status_code} {resp.text}")
         return None
 
     data = resp.json()
@@ -115,7 +119,7 @@ def get_credentials_for_identity(identity_id: str, jwt_token: str, user_pool_pro
 
     resp = requests.post(url, headers=headers, json=payload, timeout=30)
     if resp.status_code != 200:
-        print(f"GetCredentialsForIdentity failed: {resp.status_code} {resp.text}")
+        logger.error(f"GetCredentialsForIdentity failed: {resp.status_code} {resp.text}")
         return None
 
     data = resp.json()
@@ -142,17 +146,17 @@ def get_fresh_credentials() -> Optional[Dict]:
     # If no ID token or it's expired, refresh it
     if not id_token or is_token_expired(id_token):
         if not id_token:
-            print("No ID token found, using refresh token to get new one...")
+            logger.info("No ID token found, using refresh token to get new one...")
         else:
-            print("ID token expired, refreshing...")
+            logger.info("ID token expired, refreshing...")
             
         if not refresh_token:
-            print("COGNITO_REFRESH_TOKEN not set in .env")
+            logger.error("COGNITO_REFRESH_TOKEN not set in .env")
             return None
         
         new_id_token = refresh_id_token(refresh_token, client_id)
         if not new_id_token:
-            print("Failed to refresh token")
+            logger.error("Failed to refresh token")
             return None
         
         id_token = new_id_token
@@ -167,23 +171,29 @@ def get_fresh_credentials() -> Optional[Dict]:
     if not identity_id:
         return None
 
-    print(f"Got Cognito Identity ID: {identity_id}")
+    logger.debug(f"Got Cognito Identity ID: {identity_id}")
 
     # Step 2: Get credentials
     creds = get_credentials_for_identity(identity_id, id_token, user_pool_provider)
     if not creds:
         return None
 
-    print(f"Got fresh AWS credentials (expires: {creds.get('Expiration')})")
+    logger.debug(f"Got fresh AWS credentials (expires: {creds.get('Expiration')})")
     return creds
 
 
 if __name__ == "__main__":
     from dotenv import load_dotenv
 
+    # Configure logging for CLI usage
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
     load_dotenv()
     credentials = get_fresh_credentials()
     if credentials:
         print(json.dumps(credentials, indent=2))
     else:
-        print("Failed to fetch credentials")
+        logger.error("Failed to fetch credentials")

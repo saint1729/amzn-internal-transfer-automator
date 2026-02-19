@@ -16,6 +16,8 @@ from google.genai import types
 
 from get_jobs import get_jobs
 
+from get_employee_details import get_employee_hierarchy  # For enriching job data with employee hierarchy
+
 
 load_dotenv()
 
@@ -839,11 +841,14 @@ async def process_one_job(runtime: AdkRuntime, candidate_text: str, sanitized_jo
         json.dumps(cost_by_model),
     )
 
+    hiring_manager_usernames = sanitized_job["hiring_manager_usernames"]
+
     return {
         "job_id": sanitized_job["job_id"],
         "title": sanitized_job["title"],
-        "hiring_manager_usernames": sanitized_job["hiring_manager_usernames"],
+        "hiring_manager_usernames": hiring_manager_usernames,
         "recruiter_usernames": sanitized_job["recruiter_usernames"],
+        "employee_hierarchy": get_employee_hierarchy(hiring_manager_usernames[0], target_level=8) if hiring_manager_usernames else None,
         "decision": final_decision.get("decision"),
         "confidence": final_decision.get("confidence"),
         "score": final_decision.get("score"),
@@ -905,8 +910,8 @@ async def main() -> None:
         logging.info("No new jobs to process. Exiting.")
         return
     
-    # keep 3 while debugging
-    sanitized_jobs = sanitized_jobs[:3]
+    # keep 1 while debugging
+    sanitized_jobs = sanitized_jobs[:1]
 
     session_service = InMemorySessionService()
 

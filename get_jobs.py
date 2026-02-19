@@ -9,13 +9,16 @@ import datetime
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sys
-from typing import Dict
 from urllib.parse import parse_qsl, quote, urlparse
 
 import requests
 from dotenv import load_dotenv
+
+# Configure logger for this module
+logger = logging.getLogger(__name__)
 
 
 def sign_request(method, url, headers, access_key, secret_key, session_token, region="us-west-2", service="execute-api"):
@@ -96,11 +99,11 @@ def get_jobs():
             secret_key = fresh_creds.get("SecretKey")
             session_token = fresh_creds.get("SessionToken")
     except Exception as e:
-        print(f"Failed to fetch Cognito credentials: {e}")
+        logger.error(f"Failed to fetch Cognito credentials: {e}")
         return 1
 
     if not (access_key and secret_key):
-        print("No AWS credentials available. Set COGNITO_REFRESH_TOKEN in .env")
+        logger.error("No AWS credentials available. Set COGNITO_REFRESH_TOKEN in .env")
         return 1
 
     sess = requests.Session()
@@ -124,21 +127,21 @@ def get_jobs():
             "User-Agent": "python-requests/unknown",
         }
 
-        print(f"GET {page_url}")
-        print("Signing request with fresh Cognito credentials...")
+        logger.debug(f"GET {page_url}")
+        logger.debug("Signing request with fresh Cognito credentials...")
         signed_headers = sign_request("GET", page_url, headers, access_key, secret_key, session_token)
 
         resp = sess.get(page_url, headers=signed_headers, timeout=30)
-        print(f"status: {resp.status_code}")
+        logger.debug(f"status: {resp.status_code}")
 
         try:
             data = resp.json()
         except Exception:
-            print("Non-JSON response:", resp.text[:500])
+            logger.error(f"Non-JSON response: {resp.text[:500]}")
             return None
 
         if resp.status_code >= 400:
-            print(json.dumps(data, indent=2))
+            logger.error(f"API error response: {json.dumps(data, indent=2)}")
             return None
 
         search = data.get("jobSearchResults", {})
@@ -155,7 +158,7 @@ def get_jobs():
                 total_found = None
 
         # Progress print
-        print(f"Fetched {len(page_jobs)} jobs (start={start}) — total so far: {len(all_jobs)}")
+        logger.info(f"Fetched {len(page_jobs)} jobs (start={start}) — total so far: {len(all_jobs)}")
 
         # Stop conditions
         if not page_jobs:
@@ -166,15 +169,21 @@ def get_jobs():
         # Advance start
         start += page_limit
 
-    print(f"\nTotal jobs collected: {len(all_jobs)}")
+    logger.info(f"\nTotal jobs collected: {len(all_jobs)}")
     return all_jobs
 
 
 if __name__ == "__main__":
+    # Configure logging for CLI usage
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
     result = get_jobs()
     if result is None:
         sys.exit(1)
     # Print brief summary
     print(f"{json.dumps(result[0], indent=4) if result else 'No jobs found'}")
-    print(json.dumps({"collected": len(result)}, indent=4))
+    print(json.dumps({"jobCount": len(result)}, indent=4))
     sys.exit(0)

@@ -391,8 +391,12 @@ def usage_from_env() -> int:
     if bcc_addrs_raw:
         bcc_addrs = [s.strip() for s in bcc_addrs_raw.split(",") if s.strip()]
 
-    subject = os.getenv("SUBJECT", "Test email from script")
-    body = os.getenv("BODY", "<p>Test</p><p>Thanks,</p><p>Your script</p>")
+    subject = os.getenv("SUBJECT")
+    body = os.getenv("BODY")
+
+    if not subject or not body:
+        print("SUBJECT and BODY must be set in .env. Exiting.")
+        return 1
 
     print(f"Sending email to: {to_addrs}")
     if cc_addrs:

@@ -10,7 +10,7 @@ Python automation for Amazon internal tools:
 
 ## Design
 
-![Internal Transfers Automator - Design Diagram](Internal%20Transfers%20Automator%20-%20Design%20Diagram.drawio.png)
+![Internal Transfers Automator - Design Diagram](Internal%20Transfers%20Automator%20-%20Design%20Diagram.jpg)
 
 ## Setup
 

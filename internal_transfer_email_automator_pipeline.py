@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""internal_transfer_automator_pipeline.py
+"""internal_transfer_email_automator_pipeline.py
 
 Pipeline to send personalized emails to hiring managers based on job match results.
 
@@ -16,7 +16,7 @@ This script:
 5. Updates state file with sent job IDs
 
 Usage:
-  python internal_transfer_automator_pipeline.py [--dry-run] [--force-resend-all]
+  python internal_transfer_email_automator_pipeline.py [--dry-run] [--force-resend-all]
   
   --dry-run: Preview emails without sending them
   --force-resend-all: Ignore state file and resend all jobs
@@ -224,8 +224,8 @@ def build_email_addresses(employee_hierarchy: List[List[str]]) -> Dict[str, List
         if person[0]:  # Check alias exists
             cc_addrs.append(f"{person[0]}@amazon.com")
     
-    return {"to": [], "cc": []}
-    # return {"to": to_addrs, "cc": cc_addrs}
+    # return {"to": [], "cc": []}
+    return {"to": to_addrs, "cc": cc_addrs}
 
 
 def prepare_email_content(

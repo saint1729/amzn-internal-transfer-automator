@@ -4,16 +4,16 @@
 Generates LLM responses for internal transfer informational requests.
 
 This script:
-1. Reads job IDs from input file (JSON with 'sent_jobs' array) or command-line arguments
-2. Checks per-job files for existing responses
-3. Skips jobs that already have responses generated (unless --force is used)
-4. Fetches job details for jobs without responses
-5. Uses Google ADK agent to generate 3 responses (~140 words each):
-   - Why interested in the role
-   - Relevant skills and experience
-   - Forte context summary
-6. Saves each job result immediately to per_job_request_informational/{job_id}.json
-7. Runs all jobs in parallel for efficiency
+1. Auto-discovers unprocessed jobs from per_job/ folder (job_matcher YES-decision output)
+   OR reads job IDs from command-line arguments or a JSON file
+2. Skips jobs that already have responses generated (unless --force is used)
+3. Fetches job details for jobs without responses
+4. Uses Google ADK agent to generate 3 responses:
+   - Why interested in the role (~240 words)
+   - Relevant skills and experience (~240 words)
+   - Forte context summary (130-150 words)
+5. Saves each job result immediately to per_job_request_informational/{job_id}.json
+6. Runs all jobs in parallel for efficiency
 
 Note: This script ONLY generates responses. It does NOT submit them.
 Use internal_transfer_request_informational_automator_pipeline.py to submit.
@@ -30,14 +30,17 @@ Per-job file structure: output/per_job_request_informational/{job_id}.json
 }
 
 Usage:
-    # Generate responses for jobs in file
-    python request_informational_filler.py --file output/sent_emails_state.json
+    # Auto-discover and process all unprocessed jobs from per-job folder (default)
+    python request_informational_filler.py
     
     # Generate for specific job IDs
     python request_informational_filler.py 3185242 3185630
     
+    # Generate responses for jobs in file
+    python request_informational_filler.py --file output/sent_emails_state.json
+    
     # Force regenerate (ignores existing responses)
-    python request_informational_filler.py --file jobs.json --force
+    python request_informational_filler.py --force
 """
 import argparse
 import asyncio
@@ -145,6 +148,12 @@ def load_config() -> Dict[str, str]:
     return config
 
 
+def get_job_matcher_per_job_dir() -> Path:
+    """Get the job_matcher per-job directory containing YES/NO/ERROR decision files."""
+    results_folder = os.getenv("JOB_MATCH_RESULTS_FOLDER_NAME", "output")
+    return Path(results_folder) / "per_job"
+
+
 def get_per_job_dir() -> Path:
     """Get the directory for per-job intermediate results."""
     results_folder = os.getenv("JOB_MATCH_RESULTS_FOLDER_NAME", "output")
@@ -203,6 +212,66 @@ def read_job_ids_from_json(file_path: str) -> List[str]:
         return []
 
 
+def get_jobs_without_responses() -> List[str]:
+    """Return YES-decision job IDs that have not been successfully inferred yet.
+
+    Sources job IDs from the job_matcher per_job folder (output/per_job/) - only
+    jobs with decision='YES' are considered. Cross-references with the filler's
+    per_job_request_informational/ folder to exclude jobs already successfully processed.
+
+    A job needs (re)processing if:
+    - It has no per_job_request_informational file (brand new match from job_matcher)
+    - It has a per_job_request_informational file but responses is null (inference_error retry)
+
+    Returns:
+        List of job IDs that need inference
+    """
+    matcher_per_job_dir = get_job_matcher_per_job_dir()
+    filler_per_job_dir = get_per_job_dir()
+
+    if not matcher_per_job_dir.exists():
+        logger.warning(f"job_matcher per-job directory not found: {matcher_per_job_dir}")
+        logger.warning("Run job_matcher.py first to generate job matches.")
+        return []
+
+    # Collect YES-decision job IDs from job_matcher output
+    yes_job_ids = []
+    for job_file in sorted(matcher_per_job_dir.glob("*.json")):
+        try:
+            with open(job_file, 'r') as f:
+                data = json.load(f)
+            if data.get("decision") == "YES":
+                yes_job_ids.append(job_file.stem)
+        except Exception as e:
+            logger.warning(f"Failed to read {job_file}: {e}")
+
+    if not yes_job_ids:
+        logger.info("No YES-decision jobs found in job_matcher output.")
+        return []
+
+    logger.info(f"Found {len(yes_job_ids)} YES-decision job(s) from job_matcher.")
+
+    # Filter out jobs already successfully processed
+    unprocessed = []
+    for job_id in yes_job_ids:
+        filler_file = filler_per_job_dir / f"{job_id}.json"
+        if not filler_file.exists():
+            # Brand new job - never processed by filler
+            unprocessed.append(job_id)
+            logger.debug(f"Job {job_id}: brand new (no filler file) - will process")
+        else:
+            try:
+                with open(filler_file, 'r') as f:
+                    data = json.load(f)
+                if not data.get("responses"):
+                    unprocessed.append(job_id)
+                    logger.debug(f"Job {job_id}: retry (status: {data.get('status', 'unknown')}) - will process")
+            except Exception as e:
+                logger.warning(f"Failed to read filler file for {job_id}: {e}")
+
+    return unprocessed
+
+
 def setup_agent(api_key: str, model_name: str) -> Tuple[LlmAgent, Runner, InMemorySessionService]:
     """Configure and return Google ADK LlmAgent with runner."""
     # Set API key as environment variable (ADK reads from environment)
@@ -219,7 +288,7 @@ def setup_agent(api_key: str, model_name: str) -> Tuple[LlmAgent, Runner, InMemo
             "You are an expert career advisor helping candidates write compelling, "
             "authentic responses for internal job transfer requests at Amazon. "
             "Your responses should be professional, specific, and tailored to the job. "
-            "Target approximately 140 words per response. "
+            "Target approximately 140 words per response unless explicitly stated otherwise. "
             "Use concrete examples and avoid generic statements. "
             "Match the tone to Amazon's leadership principles and culture."
         )
@@ -285,7 +354,7 @@ async def generate_interest_reason(
 ) -> str:
     """Generate response for 'Why are you interested in this role?'
     
-    Target: ~140 words
+    Target: ~240 words
     """
     job_title = job_details.get('job', {}).get('role', {}).get('title', 'SDE - II')
     job_desc = job_details.get('job', {}).get('descriptionInternal', '')
@@ -300,12 +369,12 @@ Job Description: {job_desc}
 Candidate Background:
 {candidate_summary}
 
-Write a personalized, enthusiastic response in 1 paragraph (~140 words) explaining why the candidate is interested in this specific role. Focus on:
+Write a personalized, enthusiastic response in 1 paragraph (~240 words) explaining why the candidate is interested in this specific role. Focus on:
 1. Alignment between the role and the candidate's interests/goals
 2. Specific aspects of the job description that resonate
 3. How this role fits into the candidate's career trajectory
 
-USE FIRST PERSON AND BE AUTHENTIC, SPECIFIC, FORMAL, AND ENTHUSIASTIC. Avoid generic statements. Reference specific details from the job description. Make sure to use keyboard characters ONLY.`
+USE FIRST PERSON AND BE AUTHENTIC, SPECIFIC, FORMAL, AND ENTHUSIASTIC. Avoid generic statements. Reference specific details from the job description. Make sure to use keyboard/ASCII characters ONLY.`
 
 Response:"""
     
@@ -328,7 +397,7 @@ async def generate_qualifications(
 ) -> str:
     """Generate response for 'What are your relevant skills and experience?'
     
-    Target: ~140 words
+    Target: ~240 words
     """
     job_title = job_details.get('job', {}).get('role', {}).get('title', 'SDE - II')
     qualifications = job_details.get('job', {}).get('jobQualifications', [])
@@ -359,12 +428,12 @@ Candidate's Manager Assessment (from Forte):
 Leadership Strengths from Forte by manager:
 {', '.join(forte_details.get('managerPortion', {}).get('leadershipPrinciples', []))}
 
-Write a confident, specific response in 1 paragraph (~140 words) highlighting the candidate's relevant skills and experience. Focus on:
+Write a confident, specific response in 1 paragraph (~240 words) highlighting the candidate's relevant skills and experience. Focus on:
 1. How their background matches the required qualifications
 2. Specific technical skills and accomplishments
 3. Unique strengths that set them apart
 
-USE FIRST PERSON AND BE AUTHENTIC, SPECIFIC, FORMAL, AND ENTHUSIASTIC. Be specific with examples. Match the tone to the seniority level of the role. Avoid generic claims without evidence. Make sure to use keyboard characters ONLY.
+USE FIRST PERSON AND BE AUTHENTIC, SPECIFIC, FORMAL, AND ENTHUSIASTIC. Be specific with examples. Match the tone to the seniority level of the role. Avoid generic claims without evidence. Make sure to use keyboard/ASCII characters ONLY.
 
 Response:"""
     
@@ -423,7 +492,7 @@ Recent Work (past 2 weeks):
 
 Performance Rating: {forte_details.get('sharedPerformanceRating', 'MEETS_HIGH_BAR')}
 
-Write the Forte context summary in 1 paragraph (~140 words) covering:
+Write the Forte context summary in 1 paragraph. You MUST write strictly under 145 words. Do NOT exceed 144 words under any circumstances. Cover:
 1. Key strengths and superpowers
 2. Performance and impact
 3. Leadership principles demonstrated
@@ -431,7 +500,7 @@ Write the Forte context summary in 1 paragraph (~140 words) covering:
 
 Be factual and professional. This will be shared directly with the hiring manager.
 
-IMPORTANT: USE FIRST PERSON AND BE AUTHENTIC, SPECIFIC, FORMAL, AND ENTHUSIASTIC. Write ONLY the summary paragraph itself. Do NOT include any meta-text like "Here is a summary" or "Summary:" - just write the actual content that will be shared with the hiring manager. Make sure to use keyboard characters ONLY.
+IMPORTANT: USE FIRST PERSON AND BE AUTHENTIC, SPECIFIC, FORMAL, AND ENTHUSIASTIC. Write ONLY the summary paragraph itself. Do NOT include any meta-text like "Here is a summary" or "Summary:" - just write the actual content that will be shared with the hiring manager. Make sure to use keyboard/ASCII characters ONLY.
 
 Context:"""
     
@@ -452,7 +521,8 @@ Context:"""
                 result = result[len(prefix):].strip()
                 break
         
-        logger.info(f"Generated Forte context ({len(result.split())} words)")
+        original_word_count = len(result.split())
+        logger.info(f"Generated Forte context ({original_word_count} words)")
         return result
     except Exception as e:
         logger.error(f"Failed to generate Forte context: {e}")
@@ -635,7 +705,7 @@ def main():
     parser.add_argument(
         'job_ids',
         nargs='*',
-        help='Job IDs to process (e.g., 3185242 3185246)'
+        help='Job IDs to process (e.g., 3185242 3185246). If omitted, auto-discovers unprocessed jobs from per-job folder.'
     )
     parser.add_argument(
         '--file',
@@ -650,7 +720,7 @@ def main():
     
     args = parser.parse_args()
     
-    # Collect job IDs from args or file
+    # Collect job IDs: explicit args/file take priority, otherwise auto-discover
     job_ids = []
     
     if args.job_ids:
@@ -665,13 +735,40 @@ def main():
             sys.exit(1)
     
     if not job_ids:
-        logger.error("No job IDs provided. Use positional arguments or --file")
-        parser.print_help()
-        sys.exit(1)
-    
-    logger.info(f"Found {len(job_ids)} job(s) to process: {', '.join(job_ids)}")
-    
-    # Determine which jobs to skip (already have responses)
+        # Auto-discover: read YES-decision jobs from job_matcher, skip already successful ones
+        matcher_dir = get_job_matcher_per_job_dir()
+        logger.info(f"No job IDs specified - scanning {matcher_dir} for unprocessed YES-decision jobs...")
+        job_ids = get_jobs_without_responses()
+        if not job_ids:
+            logger.info("No unprocessed jobs found. All YES-decision jobs already have responses.")
+            sys.exit(0)
+        logger.info(f"Auto-discovered {len(job_ids)} unprocessed job(s): {', '.join(job_ids)}")
+    else:
+        logger.info(f"Found {len(job_ids)} job(s) to process: {', '.join(job_ids)}")
+        # Filter out non-YES jobs even when explicitly provided
+        matcher_per_job_dir = get_job_matcher_per_job_dir()
+        non_yes = []
+        yes_only = []
+        for job_id in job_ids:
+            matcher_file = matcher_per_job_dir / f"{job_id}.json"
+            if matcher_file.exists():
+                try:
+                    with open(matcher_file) as f:
+                        decision = json.load(f).get("decision")
+                    if decision != "YES":
+                        non_yes.append((job_id, decision))
+                        continue
+                except Exception:
+                    pass  # Can't read file - allow through, will fail at job details step
+            yes_only.append(job_id)
+        if non_yes:
+            logger.warning(
+                f"Skipping {len(non_yes)} non-YES job(s): "
+                + ", ".join(f"{jid}({dec})" for jid, dec in non_yes)
+            )
+        job_ids = yes_only
+
+    # Determine which jobs to skip (already have responses) - only applies when explicitly provided
     jobs_to_skip = set()
     
     if not args.force:

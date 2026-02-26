@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+from datetime import datetime, timezone
 import html
 import json
 import logging
@@ -218,7 +219,8 @@ def persist_per_job_result(result: Dict[str, Any]) -> None:
     jid = str(result.get("job_id") or "").strip()
     if not jid:
         return
-    atomic_write_json(per_job_path(jid), result)
+    timestamped = {"timestamp": datetime.now(timezone.utc).isoformat(), **result}
+    atomic_write_json(per_job_path(jid), timestamped)
 
 
 def persist_per_job_error(job: Dict[str, Any], stage: str, err: Exception) -> None:
@@ -227,6 +229,7 @@ def persist_per_job_error(job: Dict[str, Any], stage: str, err: Exception) -> No
         return
 
     payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "job_id": jid,
         "title": job.get("title"),
         "decision": "ERROR",
